@@ -1,0 +1,89 @@
+name: Publish 20260922 Full142 QA
+
+on:
+  push:
+    branches:
+      - publish-20260922-full142
+    paths:
+      - '.github/workflows/publish-20260922-full142.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CO_OLD: groundrove-us-co-all-qualified-minerals-qa-35689318863
+      AZ_OLD: groundrove-us-az-all-qualified-minerals-qa-35689318863
+      CO_NEW: groundrove-us-co-all-qualified-minerals-qa-20260922-full142
+      AZ_NEW: groundrove-us-az-all-qualified-minerals-qa-20260922-full142
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Prepare source manifests and metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/co out/az
+          gh release download "$CO_OLD" -D out/co -p manifest.json
+          gh release download "$AZ_OLD" -D out/az -p manifest.json
+          gh release download "$CO_OLD" -D out/co -p '*source-metadata.json' || true
+          gh release download "$AZ_OLD" -D out/az -p '*source-metadata.json' || true
+
+      - name: Apply verified 142-row delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREP=qa/full142/groundrove_co_az_mineral_delta_target_geometry_prep_2026-09-22.json
+          python3 qa/full142/apply_full142.py             --state CO --prep "$PREP" --manifest out/co/manifest.json --workdir out/co             --old-tag "$CO_OLD" --new-tag "$CO_NEW"
+          python3 qa/full142/apply_full142.py             --state AZ --prep "$PREP" --manifest out/az/manifest.json --workdir out/az             --old-tag "$AZ_OLD" --new-tag "$AZ_NEW"
+
+      - name: Validate combined counts and spatial policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import gzip, json, pathlib
+          prep=json.load(open("qa/full142/groundrove_co_az_mineral_delta_target_geometry_prep_2026-09-22.json"))
+          assert len(prep["records"]) == 142
+          assert sum(r["state"]=="CO" for r in prep["records"]) == 98
+          assert sum(r["state"]=="AZ" for r in prep["records"]) == 44
+          assert sum(r["delta_action"]=="ENRICH_EXISTING" for r in prep["records"]) == 10
+          assert sum(r["delta_action"]=="NEW_OCCURRENCE" for r in prep["records"]) == 69
+          assert sum(r["delta_action"]=="AREA_EVIDENCE" for r in prep["records"]) == 63
+          # Only the already-verified Black Hills source point may turn a formerly unresolved
+          # candidate into a new map point. No area polygon is manufactured by this workflow.
+          geom=[r for r in prep["records"] if isinstance(r.get("geometry"),dict)]
+          assert len(geom)==1 and geom[0]["id"]=="cand-az-fire-agate-black-hills-rockhound-area"
+          print("validated: 142 = 10 enrich + 69 occurrences + 63 area evidence; no invented geometry")
+          PY
+
+      - name: Build checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          for d in out/co out/az; do
+            (
+              cd "$d"
+              rm -f SHA256SUMS.txt
+              find . -maxdepth 1 -type f -printf '%f\n' | sort | while read -r f; do
+                sha256sum "$f"
+              done > SHA256SUMS.txt
+            )
+          done
+
+      - name: Publish CO and AZ prereleases
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tag in "$CO_NEW" "$AZ_NEW"; do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release delete "$tag" --cleanup-tag -y
+            fi
+          done
+          gh release create "$CO_NEW" out/co/*             --prerelease             --title "GroundRove CO all-qualified minerals QA — full 142 delta"             --notes "QA only. September 22 all-qualified Colorado mineral data plus the verified 142-row CO/AZ delta subset applicable to Colorado. Spatial precision is preserved; no coordinates or polygons were invented."
+          gh release create "$AZ_NEW" out/az/*             --prerelease             --title "GroundRove AZ all-qualified minerals QA — full 142 delta"             --notes "QA only. September 22 all-qualified Arizona mineral data plus the verified 142-row CO/AZ delta subset applicable to Arizona. Spatial precision is preserved; no coordinates or polygons were invented."
