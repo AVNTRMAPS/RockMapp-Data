@@ -1,4 +1,5 @@
 name: Publish 20260922 Full142 QA
+# rerun with complete 142-row prep
 
 on:
   push:
