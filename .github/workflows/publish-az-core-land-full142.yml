@@ -1,0 +1,123 @@
+name: Publish AZ Core Land Full142 QA
+
+on:
+  push:
+    branches:
+      - fix/az-core-land-full142-20260922
+    paths:
+      - '.github/workflows/publish-az-core-land-full142.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE_TAG: groundrove-us-az-core-land-20260913-qa1
+      MINERAL_TAG: groundrove-us-az-all-qualified-minerals-qa-20260922-full142
+      NEW_TAG: groundrove-us-az-core-land-full142-20260922-qa1
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Download base and mineral manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/base out/mineral out/release
+          gh release download "$BASE_TAG" -D out/base -p manifest.json
+          gh release download "$MINERAL_TAG" -D out/mineral -p manifest.json
+          gh release download "$MINERAL_TAG" -D out/release -p '*source-metadata.json' || true
+          gh release download "$MINERAL_TAG" -D out/release -p 'FULL142-PROVENANCE.json' || true
+
+      - name: Compose corrected Arizona core manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+
+          base=json.load(open("out/base/manifest.json"))
+          mineral=json.load(open("out/mineral/manifest.json"))
+
+          assert base["manifestVersion"] == 2
+          assert base["regionId"] == "us-az"
+          assert base["packageId"] == "core"
+          assert base["status"] == "published"
+          assert "BASEMAP" in base["capabilities"]
+          assert "LAND_STATUS" in base["capabilities"]
+
+          base_by={f["id"]:f for f in base["files"]}
+          min_by={f["id"]:f for f in mineral["files"]}
+          for fid in ("minerals","mineral_localities","mineral_evidence"):
+              assert fid in min_by, fid
+              if fid in base_by:
+                  idx=next(i for i,f in enumerate(base["files"]) if f["id"]==fid)
+                  base["files"][idx]=min_by[fid]
+              else:
+                  base["files"].append(min_by[fid])
+
+          base["version"]=str(base["version"])+"-full142"
+          base["publishedAt"]="2026-09-22T00:00:00Z"
+          base["message"]="QA: current Arizona core+land package with September 22 all-qualified minerals and verified Full142 delta."
+
+          # Fail closed on the exact live V2 contract.
+          assert base["status"] == "published"
+          assert base["styleSchemaVersion"] == 1
+          assert {"BASEMAP","LAND_STATUS"}.issubset(set(base["capabilities"]))
+          ids={f["id"] for f in base["files"]}
+          for fid in ("style","base","land","minerals","mineral_localities","mineral_evidence"):
+              assert fid in ids, fid
+
+          pathlib.Path("out/release/manifest.json").write_text(
+              json.dumps(base, indent=2, ensure_ascii=False)+"\n")
+          print("HEADER", {k:base.get(k) for k in (
+              "manifestVersion","regionId","packageId","status","styleSchemaVersion",
+              "version","capabilities")})
+          print("FILES", [(f["id"],f["fileName"]) for f in base["files"]])
+          PY
+
+      - name: Verify all manifest URLs are reachable
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > /tmp/urls.txt
+          import json
+          x=json.load(open("out/release/manifest.json"))
+          for f in x["files"]:
+              print(f["url"])
+          PY
+          while IFS= read -r url; do
+            curl -fsSIL --retry 2 --max-time 30 "$url" >/dev/null
+          done < /tmp/urls.txt
+
+      - name: Build checksums and notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > out/release/BUILD.txt <<EOF
+          Base Arizona core: $BASE_TAG
+          Mineral source: $MINERAL_TAG
+          Status: published
+          Land status capability preserved: YES
+          Full142 mineral data: YES
+          EOF
+          (
+            cd out/release
+            rm -f SHA256SUMS.txt
+            find . -maxdepth 1 -type f -printf '%f\n' | sort | while read -r f; do
+              sha256sum "$f"
+            done > SHA256SUMS.txt
+          )
+
+      - name: Publish corrected Arizona QA release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$NEW_TAG" >/dev/null 2>&1; then
+            gh release delete "$NEW_TAG" --cleanup-tag -y
+          fi
+          gh release create "$NEW_TAG" out/release/*             --prerelease             --title "GroundRove AZ core+land Full142 QA"             --notes "QA only. Preserves the current published Arizona core+land package contract and overlays the September 22 all-qualified mineral indexes plus verified Full142 delta. No geometry invented."
